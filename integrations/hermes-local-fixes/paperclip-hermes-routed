@@ -1,0 +1,63 @@
+#!/bin/bash
+# Wrapper for Paperclip's hermes_local adapter (set it as the agent's hermesCommand).
+#
+# 1. Lets the Hermes profile choose the model per step (delegation model_map),
+#    by dropping the -m/--provider flags Paperclip adds.
+# 2. Hands the per-run Paperclip API key to Hermes tools. Hermes runs tools in
+#    its gateway daemon and drops every env var whose name looks like a secret
+#    (KEY, TOKEN, AUTH, ...), so PAPERCLIP_API_KEY never reaches curl/python.
+#    The key goes into a 0600 file that is removed when the run ends; only the
+#    file path travels, under a non-secret name.
+#
+# Hermes config (~/.hermes/config.yaml) must forward the non-secret names:
+#
+#   terminal:
+#     client_env_passthrough:
+#       - PAPERCLIP_API_URL
+#       - PAPERCLIP_RUN_ACCESS_FILE
+#       - PAPERCLIP_AGENT_ID
+#       - PAPERCLIP_COMPANY_ID
+#       - PAPERCLIP_RUN_ID
+#       - PAPERCLIP_TASK_ID
+#       - PAPERCLIP_WAKE_REASON
+#       - PAPERCLIP_WAKE_COMMENT_ID
+
+hermes=${HERMES_BIN:-hermes}
+
+if [[ $# -lt 3 || $1 != chat || $2 != -q ]]; then
+    exec "$hermes" "$@"
+fi
+
+forward=("$1" "$2" "$3")
+shift 3
+
+access_file=
+if [[ -n ${PAPERCLIP_API_KEY:-} ]]; then
+    dir=${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}
+    mkdir -p "$dir" 2>/dev/null
+    access_file=$(umask 077; mktemp "$dir/paperclip-run-access.XXXXXX") || access_file=
+    if [[ -n $access_file ]]; then
+        printf '%s' "$PAPERCLIP_API_KEY" > "$access_file"
+        export PAPERCLIP_RUN_ACCESS_FILE=$access_file
+        trap 'rm -f "$access_file"' EXIT
+        forward[2]+=$'\n\nPaperclip API access in tools: $PAPERCLIP_API_KEY is not available inside your tool sandbox. Read the bearer token from the file at $PAPERCLIP_RUN_ACCESS_FILE (for example `-H "Authorization: Bearer $(cat "$PAPERCLIP_RUN_ACCESS_FILE")"`). $PAPERCLIP_API_URL, $PAPERCLIP_RUN_ID and $PAPERCLIP_TASK_ID are available as normal. Never print or post the token.'
+    fi
+fi
+
+while (( $# )); do
+    case $1 in
+        -m|--model|--provider)
+            (( $# < 2 )) && { printf 'Missing value for %s\n' "$1" >&2; exit 2; }
+            shift 2
+            ;;
+        --model=*|--provider=*)
+            shift
+            ;;
+        *)
+            forward+=("$1")
+            shift
+            ;;
+    esac
+done
+
+"$hermes" "${forward[@]}"
